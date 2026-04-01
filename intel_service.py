@@ -11,6 +11,11 @@ injury_adapter = ESPNInjuryAdapter()
 weather_adapter = OpenMeteoAdapter()
 
 
+SEVERITY_SCORE = {"high": 3, "medium": 2, "low": 1}
+CERTAINTY_SCORE = {"confirmed": 3, "likely": 2, "uncertain": 1}
+TYPE_SCORE = {"injury": 4, "market": 3, "weather": 2, "news": 1}
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -123,10 +128,11 @@ def _injury_signals(game: Dict[str, Any], injury_resp: Dict[str, Any]) -> List[D
 
     same_team_count = sum(1 for _, injury in relevant if injury.get("team") == team)
     pos_label = f" ({top['position']})" if top.get("position") else ""
+    athlete_name = top.get("athlete") or team
     if same_team_count >= 2:
-        summary = f"{team} has multiple meaningful injury flags"
+        summary = f"{athlete_name}{pos_label} is {status} for {team}; {same_team_count} key injury flags now affect confidence"
     else:
-        summary = f"{top.get('athlete') or team}{pos_label} is {status} for {team}"
+        summary = f"{athlete_name}{pos_label} is {status} for {team}"
 
     details = {
         "athlete": top.get("athlete"),
@@ -231,6 +237,52 @@ def _weather_signals(game: Dict[str, Any], weather_resp: Dict[str, Any]) -> List
         "observedAt": _now(),
         "derivedAt": _now(),
     }]
+
+
+
+def _signal_priority_score(signal: Dict[str, Any], confidence: Dict[str, Any]) -> int:
+    severity = SEVERITY_SCORE.get(signal.get("severity"), 0)
+    certainty = CERTAINTY_SCORE.get(signal.get("certainty"), 0)
+    signal_type = TYPE_SCORE.get(signal.get("type"), 0)
+    forced = 1 if signal.get("isForced") else 0
+    degraded_bonus = 1 if (confidence or {}).get("pct", 100) <= 64 else 0
+    return (signal_type * 10) + (severity * 6) + (certainty * 3) + forced + degraded_bonus
+
+
+
+def _rank_signals(signals: List[Dict[str, Any]], confidence: Dict[str, Any]) -> List[Dict[str, Any]]:
+    ranked = []
+    for signal in signals:
+        scored = dict(signal)
+        scored["signal_score"] = _signal_priority_score(scored, confidence)
+        scored["display_priority"] = "board" if scored["signal_score"] >= 52 else "tracked"
+        ranked.append(scored)
+    ranked.sort(key=lambda s: (s.get("signal_score", 0), SEVERITY_SCORE.get(s.get("severity"), 0)), reverse=True)
+    return ranked
+
+
+
+def _synthesize_summary(signals: List[Dict[str, Any]], confidence: Dict[str, Any], snapshot: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+    if not signals:
+        return "No internal signals yet", None
+
+    top = signals[0]
+    signal_types = {s.get("type") for s in signals}
+    confidence_pct = (confidence or {}).get("pct", 70)
+    changed_market = bool(snapshot.get("changed"))
+
+    if "injury" in signal_types and changed_market:
+        return "Confidence shifted after injury context and market movement aligned", "alignment"
+    if "injury" in signal_types and confidence_pct <= 64:
+        return "Lineup/injury context is materially dragging confidence", "injury-pressure"
+    if "weather" in signal_types and changed_market:
+        return "Environment risk and market movement are pointing the same direction", "alignment"
+    if changed_market and confidence_pct <= 68:
+        return "Market movement is increasing volatility around this game", "market-volatility"
+    if "injury" in signal_types and "weather" in signal_types:
+        return "Multiple external factors are increasing uncertainty", "multi-factor"
+
+    return top.get("summary", "No internal signals yet"), None
 
 
 
@@ -416,7 +468,8 @@ async def build_game_intel(game: Dict[str, Any]) -> Dict[str, Any]:
             "derivedAt": _now(),
         })
 
-    signals.sort(key=lambda s: {"high": 3, "medium": 2, "low": 1}.get(s.get("severity"), 0), reverse=True)
+    signals = _rank_signals(signals, confidence)
+    synthesized_summary, signal_mode = _synthesize_summary(signals, confidence, snapshot)
 
     recommendation = _recommendation_from_context(game, confidence, signals)
     market_movement = _movement_map(game, snapshot)
@@ -441,6 +494,8 @@ async def build_game_intel(game: Dict[str, Any]) -> Dict[str, Any]:
         "scoreboard": scoreboard_norm,
         "snapshot": snapshot,
         "signals": signals,
+        "summary": synthesized_summary,
+        "signal_mode": signal_mode,
         "confidence": confidence,
         "recommendation": recommendation,
         "market_movement": market_movement,
@@ -493,7 +548,8 @@ async def build_board_index(games: List[Dict[str, Any]], limit: int = 50) -> Dic
             "has_high_severity": any(s.get("severity") == "high" for s in raw_signals),
             "is_volatile": confidence.get("status") == "volatile" if confidence else False,
             "has_new_signal": len(signals) > 0,
-            "summary": top_signal.get("summary") if top_signal else "No internal signals yet",
+            "signal_mode": intel.get("signal_mode"),
+            "summary": intel.get("summary") or (top_signal.get("summary") if top_signal else "No internal signals yet"),
             "coverage": intel.get("coverage", {}),
             "updated_at": intel.get("updated_at"),
         })
