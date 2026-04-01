@@ -158,6 +158,7 @@ async def load_games_payload(
 ) -> Dict[str, Any]:
     sport_list = sports.split(",") if sports else DEFAULT_SPORTS
     all_games = []
+    errors = []
     for sport in sport_list:
         cache_key = f"games:{sport}:{regions}:{markets}"
         cached = cache_get(cache_key)
@@ -172,12 +173,19 @@ async def load_games_payload(
             games = [normalize_game(g, sport) for g in raw]
             cache_set(cache_key, games)
             all_games.extend(games)
-        except HTTPException:
+        except HTTPException as e:
+            errors.append({
+                "sport": sport,
+                "status_code": e.status_code,
+                "detail": e.detail,
+            })
             continue
     return {
         "count": len(all_games),
         "sports": sport_list,
         "games": all_games,
+        "errors": errors,
+        "data_status": "degraded" if errors else "ok",
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 
