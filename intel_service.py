@@ -74,6 +74,25 @@ def _injury_weight(sport: str, injury: Dict[str, Any]) -> int:
     return base
 
 
+def _injury_freshness(injury: Dict[str, Any]) -> str:
+    date_str = injury.get("date")
+    if not date_str:
+        return "unknown"
+    try:
+        injury_date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        age_hours = (now - injury_date).total_seconds() / 3600
+        if age_hours <= 24:
+            return "fresh"
+        if age_hours <= 72:
+            return "recent"
+        if age_hours <= 168:
+            return "known"
+        return "stale"
+    except Exception:
+        return "unknown"
+
+
 def _injury_signals(game: Dict[str, Any], injury_resp: Dict[str, Any]) -> List[Dict[str, Any]]:
     injuries = injury_resp.get("injuries", [])
     if not injuries:
@@ -84,21 +103,28 @@ def _injury_signals(game: Dict[str, Any], injury_resp: Dict[str, Any]) -> List[D
     for injury in injuries:
         status = _normalize_status(injury.get("status"))
         weight = _injury_weight(sport, injury)
+        freshness = _injury_freshness(injury)
         # Suppress weak/noisy entries. Board should only surface materially relevant injury context.
         if status not in {"out", "doubtful", "questionable"}:
             continue
         if weight < 4:
             continue
-        relevant.append((weight, injury))
+        # Stale injuries (>7 days old) need much higher weight to surface
+        if freshness == "stale" and weight < 7:
+            continue
+        # Known injuries (3-7 days) need moderately higher weight
+        if freshness == "known" and weight < 5:
+            continue
+        relevant.append((weight, injury, freshness))
 
     if not relevant:
         return []
 
     relevant.sort(key=lambda x: x[0], reverse=True)
-    top_weight, top = relevant[0]
+    top_weight, top, top_freshness = relevant[0]
     team = top.get("team")
     status = _normalize_status(top.get("status"))
-    team_burden = sum(weight for weight, injury in relevant if injury.get("team") == team)
+    team_burden = sum(weight for weight, injury, _ in relevant if injury.get("team") == team)
     experience = top.get("experience_years") or 0
     position = (top.get("position") or "").upper()
     high_positions = HIGH_IMPACT_POSITIONS.get(sport, set())
@@ -112,6 +138,9 @@ def _injury_signals(game: Dict[str, Any], injury_resp: Dict[str, Any]) -> List[D
         return []
 
     severity = "high" if top_weight >= 6 or team_burden >= 8 else "medium"
+    # Demote stale/known injuries from high to medium unless they're extremely heavy
+    if top_freshness in {"stale", "known"} and severity == "high" and top_weight < 8:
+        severity = "medium"
 
     if team == game.get("home_team"):
         affected = "home"
@@ -126,13 +155,19 @@ def _injury_signals(game: Dict[str, Any], injury_resp: Dict[str, Any]) -> List[D
         benefits = []
         harms = []
 
-    same_team_count = sum(1 for _, injury in relevant if injury.get("team") == team)
+    same_team_count = sum(1 for _, injury, _ in relevant if injury.get("team") == team)
     pos_label = f" ({top['position']})" if top.get("position") else ""
     athlete_name = top.get("athlete") or team
+    freshness_note = ""
+    if top_freshness == "stale":
+        freshness_note = " (established absence)"
+    elif top_freshness == "known":
+        freshness_note = " (recent)"
+
     if same_team_count >= 2:
-        summary = f"{athlete_name}{pos_label} is {status} for {team}; {same_team_count} key injury flags now affect confidence"
+        summary = f"{athlete_name}{pos_label} is {status} for {team}{freshness_note}; {same_team_count} key injury flags now affect confidence"
     else:
-        summary = f"{athlete_name}{pos_label} is {status} for {team}"
+        summary = f"{athlete_name}{pos_label} is {status} for {team}{freshness_note}"
 
     details = {
         "athlete": top.get("athlete"),
@@ -145,6 +180,7 @@ def _injury_signals(game: Dict[str, Any], injury_resp: Dict[str, Any]) -> List[D
         "return_date": top.get("return_date"),
         "source_time": top.get("date"),
         "coverage": injury_resp.get("coverage"),
+        "freshness": top_freshness,
         "relevant_injury_count": len(relevant),
         "same_team_relevant_count": same_team_count,
         "team_injury_burden": team_burden,
@@ -270,17 +306,29 @@ def _synthesize_summary(signals: List[Dict[str, Any]], confidence: Dict[str, Any
     signal_types = {s.get("type") for s in signals}
     confidence_pct = (confidence or {}).get("pct", 70)
     changed_market = bool(snapshot.get("changed"))
+    top_freshness = top.get("details", {}).get("freshness") if isinstance(top.get("details"), dict) else None
 
-    if "injury" in signal_types and changed_market:
+    # Fresh injury + market movement = strong alignment signal
+    if "injury" in signal_types and changed_market and top_freshness in {"fresh", "recent", None}:
         return "Confidence shifted after injury context and market movement aligned", "alignment"
-    if "injury" in signal_types and confidence_pct <= 64:
+    # Fresh injury dragging confidence hard
+    if "injury" in signal_types and confidence_pct <= 64 and top_freshness in {"fresh", "recent", None}:
         return "Lineup/injury context is materially dragging confidence", "injury-pressure"
+    # Stale injury + no market movement = likely priced in
+    if "injury" in signal_types and not changed_market and top_freshness in {"stale", "known"}:
+        return "Injury context is established and likely already reflected in market pricing", "priced-in"
+    # Weather + market alignment
     if "weather" in signal_types and changed_market:
         return "Environment risk and market movement are pointing the same direction", "alignment"
+    # Market volatility
     if changed_market and confidence_pct <= 68:
         return "Market movement is increasing volatility around this game", "market-volatility"
+    # Multi-factor uncertainty
     if "injury" in signal_types and "weather" in signal_types:
         return "Multiple external factors are increasing uncertainty", "multi-factor"
+    # Signal conflict: injury says one thing, market hasn't reacted
+    if "injury" in signal_types and not changed_market and top_freshness in {"fresh", "recent"}:
+        return "Fresh injury noted but market hasn't meaningfully reacted yet", "possible-inefficiency"
 
     return top.get("summary", "No internal signals yet"), None
 
@@ -302,9 +350,23 @@ def _confidence_from_context(game: Dict[str, Any], scoreboard: Dict[str, Any] | 
 
     injuries = injury_resp.get("injuries", [])
     if injuries:
-        highest = max(_injury_weight(game.get("sport"), item) for item in injuries)
-        base -= min(10, highest * 2)
-        reasons.append("injury context is affecting confidence")
+        sport = game.get("sport")
+        fresh_injuries = [i for i in injuries if _injury_freshness(i) in {"fresh", "recent"}]
+        known_injuries = [i for i in injuries if _injury_freshness(i) == "known"]
+        stale_injuries = [i for i in injuries if _injury_freshness(i) == "stale"]
+
+        if fresh_injuries:
+            highest = max(_injury_weight(sport, item) for item in fresh_injuries)
+            base -= min(10, highest * 2)
+            reasons.append("fresh injury context is affecting confidence")
+        elif known_injuries:
+            highest = max(_injury_weight(sport, item) for item in known_injuries)
+            base -= min(5, highest)
+            reasons.append("recent injury context noted but partially priced in")
+        elif stale_injuries:
+            # Stale injuries have minimal confidence impact — market has long adjusted
+            base -= 1
+            reasons.append("established injury context acknowledged")
 
     weather = weather_resp.get("weather") or {}
     if weather.get("weather_applicable") and (weather.get("wind_speed_10m") or 0) >= 20:
