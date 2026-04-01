@@ -1,18 +1,22 @@
 # ACE Backend
 
-Sports odds and game data API for the ACE frontend.
+Sports odds and intelligence API for the ACE frontend.
+
+## Current backbone
+
+- **Market data:** The Odds API
+- **Intelligence adapter groundwork:**
+  - ESPN scoreboard (live game state)
+  - ESPN injuries (scaffolded, pending explicit team mapping)
+  - Open-Meteo weather (scaffolded, pending venue mapping)
 
 ## Setup
 
 ```bash
-# 1. Copy env and add your API key
 cp .env.example .env
-# edit .env and set ODDS_API_KEY=your_key_from_the-odds-api.com
+# set ODDS_API_KEY=...
 
-# 2. Install deps
 pip install -r requirements.txt
-
-# 3. Run
 uvicorn main:app --reload --port 8000
 ```
 
@@ -22,18 +26,26 @@ uvicorn main:app --reload --port 8000
 |---|---|
 | `GET /health` | Status + API key check |
 | `GET /sports` | All active in-season sports |
-| `GET /games` | All games (NBA/NFL/MLB/NHL/NCAAB/NCAAF) with odds |
+| `GET /games` | All games with odds |
 | `GET /games/{sport}` | Games for one sport key |
 | `GET /odds/{sport}` | Raw odds from The Odds API |
+| `GET /sources/status` | External source adapter readiness |
+| `GET /intel/game/{game_id}` | Normalized intelligence payload for one game |
+| `GET /intel/tracked` | Tracked index scaffold payload |
 
-## Sport Keys
+## Notes
 
-- `basketball_nba`
-- `americanfootball_nfl`
-- `baseball_mlb`
-- `icehockey_nhl`
-- `basketball_ncaab`
-- `americanfootball_ncaaf`
+### What is real now
+- Odds API market data
+- ESPN scoreboard adapter architecture
+- Snapshot foundation for internal market movement tracking
+- Normalized intelligence payload shape for frontend consumption
+
+### What is intentionally not guessed yet
+- ESPN team ID mapping for injury endpoints
+- Venue coordinate mapping for weather lookup
+
+Those are blocked on explicit mapping because ACE should not guess unsafe production logic.
 
 ## Docs
 

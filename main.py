@@ -7,8 +7,12 @@ Endpoints:
   GET /games/{sport}        — games filtered by sport key
   GET /sports               — list of available sport keys
   GET /odds/{sport}         — raw odds for a sport from all books
+  GET /sources/status       — current external source adapter readiness
+  GET /intel/game/{game_id} — normalized intelligence payload for one game
+  GET /intel/tracked        — tracked index payload scaffold
 
-Data source: The Odds API (the-odds-api.com)
+Data source backbone: The Odds API (the-odds-api.com)
+Intelligence adapters: ESPN scoreboard, ESPN injuries (pending team mapping), Open-Meteo (pending venue mapping)
 """
 
 from __future__ import annotations
@@ -16,25 +20,25 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
+from intel_service import build_game_intel, build_tracked_index
+
 load_dotenv()
 
 API_KEY = os.getenv("ODDS_API_KEY", "")
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 
-# Simple in-memory cache
 _cache: Dict[str, Any] = {}
-CACHE_TTL = 60  # seconds
+CACHE_TTL = 60
 
-app = FastAPI(title="ACE Backend", version="0.1.0")
+app = FastAPI(title="ACE Backend", version="0.2.0")
 
-# Allow ACE frontend (localhost dev + future domain)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -43,7 +47,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Sport keys we care about by default
 DEFAULT_SPORTS = [
     "basketball_nba",
     "americanfootball_nfl",
@@ -53,12 +56,9 @@ DEFAULT_SPORTS = [
     "americanfootball_ncaaf",
 ]
 
-# Sportsbook regions
 REGIONS = "us"
 MARKETS = "h2h,spreads,totals"
 
-
-# ── helpers ──────────────────────────────────────────────────────────────────
 
 def cache_get(key: str) -> Optional[Any]:
     entry = _cache.get(key)
@@ -90,10 +90,7 @@ async def odds_request(path: str, params: Dict[str, Any] = {}) -> Any:
 
 
 def normalize_game(raw: Dict[str, Any], sport: str) -> Dict[str, Any]:
-    """Normalize raw Odds API game into ACE format."""
     bookmakers = raw.get("bookmakers", [])
-
-    # Build per-book odds
     books_odds = []
     for book in bookmakers:
         book_entry = {
@@ -111,7 +108,6 @@ def normalize_game(raw: Dict[str, Any], sport: str) -> Dict[str, Any]:
             ]
         books_odds.append(book_entry)
 
-    # Best available moneyline per team
     best_ml: Dict[str, Optional[int]] = {}
     for book in bookmakers:
         for market in book.get("markets", []):
@@ -147,14 +143,42 @@ def is_live(commence_time: Optional[str]) -> bool:
     try:
         ct = datetime.fromisoformat(commence_time.replace("Z", "+00:00"))
         now = datetime.now(timezone.utc)
-        # consider live if started within last 4 hours
         diff = (now - ct).total_seconds()
         return 0 <= diff <= 14400
     except Exception:
         return False
 
 
-# ── routes ───────────────────────────────────────────────────────────────────
+async def load_games_payload(
+    sports: Optional[str] = None,
+    regions: str = REGIONS,
+    markets: str = MARKETS,
+) -> Dict[str, Any]:
+    sport_list = sports.split(",") if sports else DEFAULT_SPORTS
+    all_games = []
+    for sport in sport_list:
+        cache_key = f"games:{sport}:{regions}:{markets}"
+        cached = cache_get(cache_key)
+        if cached:
+            all_games.extend(cached)
+            continue
+        try:
+            raw = await odds_request(
+                f"/sports/{sport}/odds",
+                {"regions": regions, "markets": markets, "oddsFormat": "american"},
+            )
+            games = [normalize_game(g, sport) for g in raw]
+            cache_set(cache_key, games)
+            all_games.extend(games)
+        except HTTPException:
+            continue
+    return {
+        "count": len(all_games),
+        "sports": sport_list,
+        "games": all_games,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+
 
 @app.get("/health")
 async def health():
@@ -167,7 +191,6 @@ async def health():
 
 @app.get("/sports")
 async def get_sports():
-    """List all available in-season sports."""
     cache_key = "sports"
     cached = cache_get(cache_key)
     if cached:
@@ -188,31 +211,7 @@ async def get_games(
     regions: str = Query(REGIONS),
     markets: str = Query(MARKETS),
 ):
-    """All games across default (or specified) sports with live odds."""
-    sport_list = sports.split(",") if sports else DEFAULT_SPORTS
-    all_games = []
-    for sport in sport_list:
-        cache_key = f"games:{sport}:{regions}:{markets}"
-        cached = cache_get(cache_key)
-        if cached:
-            all_games.extend(cached)
-            continue
-        try:
-            raw = await odds_request(
-                f"/sports/{sport}/odds",
-                {"regions": regions, "markets": markets, "oddsFormat": "american"},
-            )
-            games = [normalize_game(g, sport) for g in raw]
-            cache_set(cache_key, games)
-            all_games.extend(games)
-        except HTTPException:
-            continue  # skip sport if no data
-    return {
-        "count": len(all_games),
-        "sports": sport_list,
-        "games": all_games,
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
-    }
+    return await load_games_payload(sports=sports, regions=regions, markets=markets)
 
 
 @app.get("/games/{sport}")
@@ -221,7 +220,6 @@ async def get_games_by_sport(
     regions: str = Query(REGIONS),
     markets: str = Query(MARKETS),
 ):
-    """Games for a specific sport key."""
     cache_key = f"games:{sport}:{regions}:{markets}"
     cached = cache_get(cache_key)
     if cached:
@@ -237,8 +235,44 @@ async def get_games_by_sport(
 
 @app.get("/odds/{sport}")
 async def get_raw_odds(sport: str, regions: str = Query(REGIONS)):
-    """Raw odds for a sport — all markets, all books."""
     return await odds_request(
         f"/sports/{sport}/odds",
         {"regions": regions, "markets": "h2h,spreads,totals,outrights", "oddsFormat": "american"},
     )
+
+
+@app.get("/sources/status")
+async def get_sources_status():
+    return {
+        "odds_api": {
+            "enabled": True,
+            "notes": "Current ACE market backbone",
+        },
+        "espn_scoreboard": {
+            "enabled": True,
+            "notes": "Unofficial but practical early source for live game state",
+        },
+        "espn_injuries": {
+            "enabled": False,
+            "notes": "Adapter scaffolded; requires explicit team ID mapping before safe live use",
+        },
+        "open_meteo": {
+            "enabled": False,
+            "notes": "Adapter scaffolded; requires venue coordinate mapping before safe live use",
+        },
+    }
+
+
+@app.get("/intel/game/{game_id}")
+async def get_game_intel(game_id: str):
+    payload = await load_games_payload()
+    game = next((g for g in payload["games"] if g["id"] == game_id), None)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    return await build_game_intel(game)
+
+
+@app.get("/intel/tracked")
+async def get_tracked_intel(limit: int = Query(10, ge=1, le=25)):
+    payload = await load_games_payload()
+    return await build_tracked_index(payload["games"], limit=limit)
