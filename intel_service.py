@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from market_snapshots import update_snapshot
 from source_adapters import ESPNInjuryAdapter, ESPNScoreboardAdapter, OpenMeteoAdapter
@@ -44,6 +44,56 @@ def _confidence_from_context(game: Dict[str, Any], scoreboard: Dict[str, Any] | 
         "label": f"{tier.title()} ({pct}%) — {status.title()}",
         "explanation": reasons[0] if reasons else "baseline confidence from current market structure",
         "factors": reasons,
+    }
+
+
+def _pick_side_market(game: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    best_ml = game.get("best_moneyline", {})
+    home = game.get("home_team")
+    away = game.get("away_team")
+    home_price = best_ml.get(home)
+    away_price = best_ml.get(away)
+    if home_price is None or away_price is None:
+        return None
+
+    def rank(price: int) -> tuple[int, int]:
+        # more negative favorite wins; among positives, smaller positive is stronger
+        return (0 if price < 0 else 1, abs(price))
+
+    side = home if rank(home_price) < rank(away_price) else away
+    market = "ml-home" if side == home else "ml-away"
+    odds = home_price if side == home else away_price
+    return {
+        "team": side,
+        "market": market,
+        "odds": odds,
+    }
+
+
+def _recommendation_from_context(game: Dict[str, Any], confidence: Dict[str, Any], signals: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if confidence.get("pct", 0) < 70:
+        return None
+
+    side_pick = _pick_side_market(game)
+    if not side_pick:
+        return None
+
+    top_signal = signals[0] if signals else None
+    reasons = [confidence.get("explanation")]
+    if top_signal:
+        reasons.append(top_signal.get("summary"))
+
+    confidence_pct = min(95, max(60, confidence.get("pct", 72) + (4 if top_signal else 0)))
+    tag = "volatile" if confidence.get("status") == "volatile" else "stable"
+
+    return {
+        "market": side_pick["market"],
+        "confidence": confidence_pct,
+        "reason": ". ".join([r for r in reasons if r]),
+        "pick": f"{side_pick['team']} ML",
+        "market_type": "Moneyline",
+        "odds": side_pick["odds"],
+        "tag": tag,
     }
 
 
@@ -100,6 +150,8 @@ async def build_game_intel(game: Dict[str, Any]) -> Dict[str, Any]:
             "createdAt": _now(),
         })
 
+    recommendation = _recommendation_from_context(game, confidence, signals)
+
     return {
         "game": game,
         "source_status": {
@@ -117,6 +169,7 @@ async def build_game_intel(game: Dict[str, Any]) -> Dict[str, Any]:
         "snapshot": snapshot,
         "signals": signals,
         "confidence": confidence,
+        "recommendation": recommendation,
         "updated_at": _now(),
     }
 
@@ -147,6 +200,7 @@ async def build_board_index(games: List[Dict[str, Any]], limit: int = 50) -> Dic
         items.append({
             "game_id": game["id"],
             "confidence": confidence,
+            "recommendation": intel.get("recommendation"),
             "signals": signals,
             "signals_count": len(signals),
             "top_signal": top_signal,
@@ -160,3 +214,29 @@ async def build_board_index(games: List[Dict[str, Any]], limit: int = 50) -> Dic
         "items": items,
         "updated_at": _now(),
     }
+
+
+async def build_top_picks(games: List[Dict[str, Any]], limit: int = 4) -> Dict[str, Any]:
+    picks = []
+    for game in games:
+        intel = await build_game_intel(game)
+        rec = intel.get("recommendation")
+        conf = intel.get("confidence")
+        if not rec or not conf:
+            continue
+        picks.append({
+            "id": f"pick-{game['id']}",
+            "gameId": game["id"],
+            "type": "ML",
+            "pick": rec.get("pick"),
+            "game": f"{game['away_team']} @ {game['home_team']}",
+            "odds": rec.get("odds"),
+            "market": rec.get("market_type"),
+            "confidence": conf,
+            "reasoning": rec.get("reason"),
+            "tag": rec.get("tag", "stable"),
+            "edge": f"+{max(1.0, round((conf.get('pct', 70) - 60) / 10, 1))}%",
+            "signals": intel.get("signals", []),
+        })
+    picks.sort(key=lambda p: p.get("confidence", {}).get("pct", 0), reverse=True)
+    return {"count": min(limit, len(picks)), "items": picks[:limit], "updated_at": _now()}

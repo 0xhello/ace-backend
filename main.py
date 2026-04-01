@@ -8,6 +8,8 @@ Endpoints:
   GET /sports               — list of available sport keys
   GET /odds/{sport}         — raw odds for a sport from all books
   GET /sources/status       — current external source adapter readiness
+  GET /intel/board          — bulk intelligence payload for dashboard board rows
+  GET /intel/picks          — backend-generated top AI picks for dashboard rail
   GET /intel/game/{game_id} — normalized intelligence payload for one game
   GET /intel/tracked        — tracked index payload scaffold
 
@@ -27,7 +29,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from intel_service import build_board_index, build_game_intel, build_tracked_index
+from intel_service import build_board_index, build_game_intel, build_top_picks, build_tracked_index
 
 load_dotenv()
 
@@ -267,6 +269,12 @@ async def get_sources_status():
 async def get_board_intel(limit: int = Query(50, ge=1, le=100)):
     payload = await load_games_payload()
     return await build_board_index(payload["games"], limit=limit)
+
+
+@app.get("/intel/picks")
+async def get_top_picks(limit: int = Query(4, ge=1, le=12)):
+    payload = await load_games_payload()
+    return await build_top_picks(payload["games"], limit=limit)
 
 
 @app.get("/intel/game/{game_id}")
