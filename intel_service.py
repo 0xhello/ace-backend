@@ -140,6 +140,7 @@ def _injury_signals(game: Dict[str, Any], injury_resp: Dict[str, Any]) -> List[D
         "source_time": top.get("date"),
         "coverage": injury_resp.get("coverage"),
         "relevant_injury_count": len(relevant),
+        "same_team_relevant_count": same_team_count,
         "team_injury_burden": team_burden,
     }
 
