@@ -28,23 +28,44 @@ def _normalize_status(status: Optional[str]) -> str:
     return "unknown"
 
 
+HIGH_IMPACT_POSITIONS = {
+    "basketball_nba": {"PG", "SG", "SF", "PF", "C"},  # all starters matter in NBA
+    "americanfootball_nfl": {"QB"},
+    "icehockey_nhl": {"G"},
+    "baseball_mlb": {"SP", "RP", "CP"},  # pitching roles
+}
+
+STAR_EXPERIENCE_THRESHOLD = 5  # 5+ years = likely established player
+
+
 def _injury_weight(sport: str, injury: Dict[str, Any]) -> int:
-    athlete = (injury.get("athlete") or "").lower()
     status = _normalize_status(injury.get("status"))
-    injury_type = (injury.get("type") or "").lower()
+    position = (injury.get("position") or "").upper()
+    experience = injury.get("experience_years") or 0
 
     base = 1
+
+    # Status weight
     if status in {"out", "doubtful"}:
         base += 2
     elif status == "questionable":
         base += 1
 
+    # Position weight — high-impact positions matter more
+    high_positions = HIGH_IMPACT_POSITIONS.get(sport, set())
+    if position in high_positions:
+        base += 2
+    elif position:
+        base += 1  # at least a known roster player
+
+    # Experience weight — veteran/established players impact more
+    if experience >= STAR_EXPERIENCE_THRESHOLD:
+        base += 1
+
+    # Sport baseline — NBA injuries tend to matter more per-player
     if sport == "basketball_nba":
         base += 1
-    if sport == "americanfootball_nfl" and any(pos in athlete for pos in ["qb", "quarterback"]):
-        base += 2
-    if sport == "icehockey_nhl" and "goalie" in injury_type:
-        base += 2
+
     return base
 
 
@@ -75,10 +96,14 @@ def _injury_signals(game: Dict[str, Any], injury_resp: Dict[str, Any]) -> List[D
 
     summary = f"{team} injury uncertainty impacting pregame read"
     if top.get("athlete") and status in {"out", "doubtful", "questionable"}:
-        summary = f"{top['athlete']} is {status} for {team}"
+        pos_label = f" ({top['position']})" if top.get("position") else ""
+        summary = f"{top['athlete']}{pos_label} is {status} for {team}"
 
     details = {
         "athlete": top.get("athlete"),
+        "position": top.get("position"),
+        "position_name": top.get("position_name"),
+        "experience_years": top.get("experience_years"),
         "status": top.get("status"),
         "type": top.get("type"),
         "short_comment": top.get("short_comment"),

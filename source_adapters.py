@@ -99,11 +99,20 @@ class ESPNInjuryAdapter:
         res.raise_for_status()
         return res.json()
 
-    async def _resolve_athlete_name(self, client: httpx.AsyncClient, ref: str) -> Optional[str]:
+    async def _resolve_athlete(self, client: httpx.AsyncClient, ref: str) -> Dict[str, Any]:
         if not ref:
-            return None
-        data = await self._fetch_json(client, ref.replace("http://", "https://"))
-        return data.get("displayName")
+            return {}
+        try:
+            data = await self._fetch_json(client, ref.replace("http://", "https://"))
+            position = data.get("position", {})
+            return {
+                "name": data.get("displayName"),
+                "position": position.get("abbreviation"),
+                "position_name": position.get("displayName"),
+                "experience_years": (data.get("experience") or {}).get("years"),
+            }
+        except Exception:
+            return {}
 
     async def _fetch_team_injuries(self, client: httpx.AsyncClient, sport_key: str, team_name: str) -> List[Dict[str, Any]]:
         team_mapping = get_espn_team_mapping(sport_key, team_name)
@@ -120,10 +129,13 @@ class ESPNInjuryAdapter:
             if not ref:
                 continue
             detail = await self._fetch_json(client, ref.replace("http://", "https://"))
-            athlete_name = await self._resolve_athlete_name(client, detail.get("athlete", {}).get("$ref", ""))
+            athlete_info = await self._resolve_athlete(client, detail.get("athlete", {}).get("$ref", ""))
             normalized.append({
                 "team": team_name,
-                "athlete": athlete_name,
+                "athlete": athlete_info.get("name"),
+                "position": athlete_info.get("position"),
+                "position_name": athlete_info.get("position_name"),
+                "experience_years": athlete_info.get("experience_years"),
                 "status": detail.get("status"),
                 "date": detail.get("date"),
                 "short_comment": detail.get("shortComment"),
