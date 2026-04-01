@@ -81,15 +81,21 @@ class ESPNScoreboardAdapter:
             "clock": status.get("displayClock"),
             "home_score": None,
             "away_score": None,
+            "home_record": None,
+            "away_record": None,
             "venue": comp.get("venue", {}).get("fullName"),
             "neutral_site": comp.get("neutralSite"),
         }
         for competitor in competitors:
             side = competitor.get("homeAway")
+            records = competitor.get("records") or []
+            overall = next((r.get("summary") for r in records if r.get("name") == "overall" or r.get("type") == "total"), None)
             if side == "home":
                 out["home_score"] = competitor.get("score")
+                out["home_record"] = overall
             elif side == "away":
                 out["away_score"] = competitor.get("score")
+                out["away_record"] = overall
         return out
 
 
