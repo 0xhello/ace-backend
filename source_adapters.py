@@ -93,9 +93,11 @@ class ESPNScoreboardAdapter:
             if side == "home":
                 out["home_score"] = competitor.get("score")
                 out["home_record"] = overall
+                out["home_winner"] = competitor.get("winner")
             elif side == "away":
                 out["away_score"] = competitor.get("score")
                 out["away_record"] = overall
+                out["away_winner"] = competitor.get("winner")
         return out
 
 
