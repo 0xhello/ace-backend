@@ -135,3 +135,28 @@ async def build_tracked_index(games: List[Dict[str, Any]], limit: int = 10) -> D
             "href": f"/dashboard/tracked/{game['id']}",
         })
     return {"count": len(items), "items": items, "updated_at": _now()}
+
+
+async def build_board_index(games: List[Dict[str, Any]], limit: int = 50) -> Dict[str, Any]:
+    items = []
+    for game in games[:limit]:
+        intel = await build_game_intel(game)
+        signals = intel.get("signals", [])
+        confidence = intel.get("confidence")
+        top_signal = signals[0] if signals else None
+        items.append({
+            "game_id": game["id"],
+            "confidence": confidence,
+            "signals": signals,
+            "signals_count": len(signals),
+            "top_signal": top_signal,
+            "has_high_severity": any(s.get("severity") == "high" for s in signals),
+            "is_volatile": confidence.get("status") == "volatile" if confidence else False,
+            "summary": top_signal.get("summary") if top_signal else "No internal signals yet",
+            "updated_at": intel.get("updated_at"),
+        })
+    return {
+        "count": len(items),
+        "items": items,
+        "updated_at": _now(),
+    }

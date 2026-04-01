@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from intel_service import build_game_intel, build_tracked_index
+from intel_service import build_board_index, build_game_intel, build_tracked_index
 
 load_dotenv()
 
@@ -263,6 +263,12 @@ async def get_sources_status():
     }
 
 
+@app.get("/intel/board")
+async def get_board_intel(limit: int = Query(50, ge=1, le=100)):
+    payload = await load_games_payload()
+    return await build_board_index(payload["games"], limit=limit)
+
+
 @app.get("/intel/game/{game_id}")
 async def get_game_intel(game_id: str):
     payload = await load_games_payload()
@@ -273,6 +279,6 @@ async def get_game_intel(game_id: str):
 
 
 @app.get("/intel/tracked")
-async def get_tracked_intel(limit: int = Query(10, ge=1, le=25)):
+async def get_tracked_intel(limit: int = Query(10, ge=1, le=100)):
     payload = await load_games_payload()
     return await build_tracked_index(payload["games"], limit=limit)
