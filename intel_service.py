@@ -75,11 +75,38 @@ def _injury_signals(game: Dict[str, Any], injury_resp: Dict[str, Any]) -> List[D
         return []
 
     sport = game.get("sport")
-    weighted = sorted(injuries, key=lambda x: _injury_weight(sport, x), reverse=True)
-    top = weighted[0]
+    relevant = []
+    for injury in injuries:
+        status = _normalize_status(injury.get("status"))
+        weight = _injury_weight(sport, injury)
+        # Suppress weak/noisy entries. Board should only surface materially relevant injury context.
+        if status not in {"out", "doubtful", "questionable"}:
+            continue
+        if weight < 4:
+            continue
+        relevant.append((weight, injury))
+
+    if not relevant:
+        return []
+
+    relevant.sort(key=lambda x: x[0], reverse=True)
+    top_weight, top = relevant[0]
     team = top.get("team")
     status = _normalize_status(top.get("status"))
-    severity = "high" if _injury_weight(sport, top) >= 4 else "medium" if _injury_weight(sport, top) >= 3 else "low"
+    team_burden = sum(weight for weight, injury in relevant if injury.get("team") == team)
+    experience = top.get("experience_years") or 0
+    position = (top.get("position") or "").upper()
+    high_positions = HIGH_IMPACT_POSITIONS.get(sport, set())
+
+    # Suppress single weak/questionable injuries unless they are truly material.
+    if status == "questionable" and top_weight < 6 and team_burden < 8:
+        return []
+    if status in {"out", "doubtful"} and top_weight < 5 and team_burden < 7:
+        return []
+    if team_burden < 7 and experience < 5 and position not in high_positions:
+        return []
+
+    severity = "high" if top_weight >= 6 or team_burden >= 8 else "medium"
 
     if team == game.get("home_team"):
         affected = "home"
@@ -94,10 +121,12 @@ def _injury_signals(game: Dict[str, Any], injury_resp: Dict[str, Any]) -> List[D
         benefits = []
         harms = []
 
-    summary = f"{team} injury uncertainty impacting pregame read"
-    if top.get("athlete") and status in {"out", "doubtful", "questionable"}:
-        pos_label = f" ({top['position']})" if top.get("position") else ""
-        summary = f"{top['athlete']}{pos_label} is {status} for {team}"
+    same_team_count = sum(1 for _, injury in relevant if injury.get("team") == team)
+    pos_label = f" ({top['position']})" if top.get("position") else ""
+    if same_team_count >= 2:
+        summary = f"{team} has multiple meaningful injury flags"
+    else:
+        summary = f"{top.get('athlete') or team}{pos_label} is {status} for {team}"
 
     details = {
         "athlete": top.get("athlete"),
@@ -110,6 +139,8 @@ def _injury_signals(game: Dict[str, Any], injury_resp: Dict[str, Any]) -> List[D
         "return_date": top.get("return_date"),
         "source_time": top.get("date"),
         "coverage": injury_resp.get("coverage"),
+        "relevant_injury_count": len(relevant),
+        "team_injury_burden": team_burden,
     }
 
     return [{
@@ -119,7 +150,7 @@ def _injury_signals(game: Dict[str, Any], injury_resp: Dict[str, Any]) -> List[D
         "severity": severity,
         "certainty": "confirmed",
         "affectedTeam": affected,
-        "direction": "negative" if status in {"out", "doubtful", "questionable"} else "uncertain",
+        "direction": "negative",
         "summary": summary,
         "details": details,
         "benefits": benefits or ["impact unclear"],
@@ -437,8 +468,17 @@ async def build_board_index(games: List[Dict[str, Any]], limit: int = 50) -> Dic
     items = []
     for game in games[:limit]:
         intel = await build_game_intel(game)
-        signals = intel.get("signals", [])
+        raw_signals = intel.get("signals", [])
         confidence = intel.get("confidence")
+        # Board should suppress injury noise; keep that depth for tracked/detail views.
+        # Only surface injury if it's high severity and confidence is materially degraded.
+        signals = [
+            s for s in raw_signals
+            if not (
+                s.get("type") == "injury"
+                and not (s.get("severity") == "high" and (confidence or {}).get("pct", 100) <= 64)
+            )
+        ]
         top_signal = signals[0] if signals else None
         items.append({
             "game_id": game["id"],
@@ -449,7 +489,7 @@ async def build_board_index(games: List[Dict[str, Any]], limit: int = 50) -> Dic
             "signals": signals,
             "signals_count": len(signals),
             "top_signal": top_signal,
-            "has_high_severity": any(s.get("severity") == "high" for s in signals),
+            "has_high_severity": any(s.get("severity") == "high" for s in raw_signals),
             "is_volatile": confidence.get("status") == "volatile" if confidence else False,
             "has_new_signal": len(signals) > 0,
             "summary": top_signal.get("summary") if top_signal else "No internal signals yet",
