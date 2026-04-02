@@ -112,6 +112,18 @@ def _injury_freshness(injury: Dict[str, Any]) -> str:
         return "unknown"
 
 
+def _is_low_materiality_injury(injury: Dict[str, Any]) -> bool:
+    text = " ".join([
+        str(injury.get("type") or ""),
+        str(injury.get("short_comment") or ""),
+        str(injury.get("long_comment") or ""),
+    ]).lower()
+    if "g league" in text or "two-way" in text or "two way" in text or "on assignment" in text:
+        return True
+    return False
+
+
+
 def _injury_signals(
     game: Dict[str, Any],
     injury_resp: Dict[str, Any],
@@ -131,6 +143,7 @@ def _injury_signals(
         side = _team_side(game, injury.get("team"))
         probable_pitcher = _mlb_probable_pitcher_for_team(scoreboard, side) if game.get("sport") == "baseball_mlb" else None
         today_relevance = "normal"
+        experience = injury.get("experience_years") or 0
         if probable_pitcher and injury.get("athlete") == probable_pitcher:
             weight += 3
             today_relevance = "probable-starter"
@@ -147,7 +160,7 @@ def _injury_signals(
         # Suppress weak/noisy entries. Board should only surface materially relevant injury context.
         if status not in {"out", "doubtful", "questionable"}:
             continue
-        if weight < 4:
+        if weight < 5:
             continue
         # Stale injuries (>7 days old) need much higher weight to surface
         if freshness == "stale" and today_relevance != "probable-starter" and weight < 8:
