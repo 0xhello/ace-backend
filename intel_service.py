@@ -623,6 +623,42 @@ def _market_tier_status(pct: int) -> Tuple[str, str]:
 
 
 
+def _best_spread_side(game: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    away = game.get("away_team")
+    home = game.get("home_team")
+    best = []
+    for book in game.get("bookmakers", []):
+        for outcome in book.get("markets", {}).get("spreads", []) or []:
+            if outcome.get("name") in {away, home} and outcome.get("point") is not None:
+                best.append({
+                    "team": outcome.get("name"),
+                    "point": outcome.get("point"),
+                    "price": outcome.get("price"),
+                })
+    if not best:
+        return None
+    best.sort(key=lambda x: (abs(x.get("point") or 0), -(x.get("price") or 0)))
+    return best[0]
+
+
+
+def _best_total_side(game: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    totals = []
+    for book in game.get("bookmakers", []):
+        for outcome in book.get("markets", {}).get("totals", []) or []:
+            if outcome.get("name") in {"Over", "Under"} and outcome.get("point") is not None:
+                totals.append({
+                    "side": outcome.get("name"),
+                    "point": outcome.get("point"),
+                    "price": outcome.get("price"),
+                })
+    if not totals:
+        return None
+    totals.sort(key=lambda x: (x.get("point") or 0, -(x.get("price") or 0)))
+    return totals[0]
+
+
+
 def _market_signal_split(signals: List[Dict[str, Any]], market_type: str) -> Tuple[List[str], List[str]]:
     supporting: List[str] = []
     opposing: List[str] = []
@@ -762,10 +798,19 @@ def _market_confidence_from_context(
             pick = _pick_side_market(game)
             lean = f"{pick['team']} ML" if pick else None
         elif market_type == "spread":
-            pick = _pick_side_market(game)
-            lean = f"{pick['team']} spread" if pick else "spread mixed"
+            spread_pick = _best_spread_side(game)
+            if spread_pick:
+                point = spread_pick.get("point")
+                lean = f"{spread_pick['team']} {('+' if point and point > 0 else '')}{point}"
+            else:
+                lean = "spread mixed"
         elif market_type == "total":
-            lean = "under" if weather_count or injury_count else "mixed"
+            total_pick = _best_total_side(game)
+            total_side = "under" if weather_count or injury_count else "over" if supporting and not opposing else "mixed"
+            if total_pick and total_side in {"under", "over"}:
+                lean = f"{total_side} {total_pick.get('point')}"
+            else:
+                lean = total_side
 
         if supporting and opposing:
             reason = f"{supporting[0]}, but {opposing[0].lower()}"
@@ -775,6 +820,11 @@ def _market_confidence_from_context(
             reason = f"mixed read: {opposing[0]}"
         else:
             reason = "limited market-specific signal support so far"
+
+        if market_type == "spread" and c["priced_in"] > 0 and supporting:
+            reason = f"{supporting[0]}, but current spread may already reflect much of the edge"
+        if market_type == "total" and weather_count and injury_count:
+            reason = "Weather and lineup context both support the current total lean"
 
         out[market_type] = {
             "pct": pct,
