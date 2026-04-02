@@ -324,6 +324,86 @@ def _weather_signals(game: Dict[str, Any], weather_resp: Dict[str, Any]) -> List
 
 
 
+def _team_context_signal(game: Dict[str, Any], team_context: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    teams = (team_context or {}).get("teams") or {}
+    signals: List[Dict[str, Any]] = []
+    for side in ("home", "away"):
+        ctx = teams.get(side) or {}
+        form = ctx.get("recent_form") or {}
+        key_stats = ctx.get("key_stats") or {}
+        team_name = ctx.get("team")
+        if not team_name:
+            continue
+
+        wins = form.get("wins_last_5", 0)
+        losses = form.get("losses_last_5", 0)
+        rest_days = form.get("rest_days")
+
+        if wins >= 4:
+            signals.append({
+                "id": f"form-{game['id']}-{side}",
+                "gameId": game["id"],
+                "type": "news",
+                "severity": "low",
+                "certainty": "likely",
+                "affectedTeam": side,
+                "direction": "positive",
+                "summary": f"{team_name} has strong recent form ({wins}-{losses} in last five)",
+                "details": {"recent_form": form, "key_stats": key_stats},
+                "benefits": [team_name],
+                "harms": [],
+                "sourceCategory": "team_context",
+                "isForced": False,
+                "isDemo": False,
+                "createdAt": _now(),
+                "observedAt": _now(),
+                "derivedAt": _now(),
+            })
+        elif losses >= 4:
+            signals.append({
+                "id": f"form-{game['id']}-{side}",
+                "gameId": game["id"],
+                "type": "news",
+                "severity": "low",
+                "certainty": "likely",
+                "affectedTeam": side,
+                "direction": "negative",
+                "summary": f"{team_name} is in poor recent form ({wins}-{losses} in last five)",
+                "details": {"recent_form": form, "key_stats": key_stats},
+                "benefits": [],
+                "harms": [team_name],
+                "sourceCategory": "team_context",
+                "isForced": False,
+                "isDemo": False,
+                "createdAt": _now(),
+                "observedAt": _now(),
+                "derivedAt": _now(),
+            })
+
+        if rest_days is not None and rest_days <= 1.0 and game.get("sport") in {"basketball_nba", "icehockey_nhl"}:
+            signals.append({
+                "id": f"rest-{game['id']}-{side}",
+                "gameId": game["id"],
+                "type": "news",
+                "severity": "low",
+                "certainty": "likely",
+                "affectedTeam": side,
+                "direction": "negative",
+                "summary": f"{team_name} is on short rest heading into this game",
+                "details": {"recent_form": form, "rest_days": rest_days},
+                "benefits": [game.get("away_team") if side == "home" else game.get("home_team")],
+                "harms": [team_name],
+                "sourceCategory": "team_context",
+                "isForced": False,
+                "isDemo": False,
+                "createdAt": _now(),
+                "observedAt": _now(),
+                "derivedAt": _now(),
+            })
+    return signals
+
+
+
 def _signal_priority_score(signal: Dict[str, Any], confidence: Dict[str, Any]) -> int:
     severity = SEVERITY_SCORE.get(signal.get("severity"), 0)
     certainty = CERTAINTY_SCORE.get(signal.get("certainty"), 0)
@@ -440,6 +520,12 @@ def _confidence_from_context(
     if home_form.get("wins_last_5", 0) >= 4 or away_form.get("wins_last_5", 0) >= 4:
         base += 1
         reasons.append("recent team form adds a bit more context stability")
+
+    if game.get("sport") in {"basketball_nba", "icehockey_nhl"}:
+        short_rest = [form for form in (home_form, away_form) if (form.get("rest_days") is not None and form.get("rest_days") <= 1.0)]
+        if short_rest:
+            base -= 2
+            reasons.append("short-rest schedule spot adds volatility")
 
     weather = weather_resp.get("weather") or {}
     if weather.get("weather_applicable") and (weather.get("wind_speed_10m") or 0) >= 20:
@@ -561,6 +647,7 @@ async def build_game_intel(game: Dict[str, Any]) -> Dict[str, Any]:
     signals: List[Dict[str, Any]] = []
     signals.extend(_injury_signals(game, injuries, scoreboard_norm, team_context))
     signals.extend(_weather_signals(game, weather))
+    signals.extend(_team_context_signal(game, team_context))
 
     if snapshot.get("changed"):
         signals.append({

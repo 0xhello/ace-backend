@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -126,36 +126,55 @@ class ESPNTeamContextAdapter:
 
     def _extract_recent_form(self, team_name: str, events: List[Dict[str, Any]], limit: int = 5) -> Dict[str, Any]:
         recent_games = []
-        wins = 0
-        losses = 0
-        for event in events[: limit * 2]:
+        upcoming = None
+        last_completed_at = None
+        for event in events:
             comp = (event.get("competitions") or [{}])[0]
             status = ((comp.get("status") or {}).get("type") or {}).get("state")
-            if status != "post":
-                continue
+            event_date = event.get("date")
             competitors = comp.get("competitors") or []
             team_comp = next((c for c in competitors if c.get("team", {}).get("displayName") == team_name), None)
             opp_comp = next((c for c in competitors if c.get("team", {}).get("displayName") != team_name), None)
             if not team_comp or not opp_comp:
                 continue
-            won = bool(team_comp.get("winner"))
-            wins += 1 if won else 0
-            losses += 0 if won else 1
-            recent_games.append({
-                "event_id": event.get("id"),
-                "date": event.get("date"),
-                "opponent": opp_comp.get("team", {}).get("displayName"),
-                "result": "W" if won else "L",
-                "team_score": team_comp.get("score"),
-                "opponent_score": opp_comp.get("score"),
-            })
-            if len(recent_games) >= limit:
-                break
+            if status == "post":
+                won = bool(team_comp.get("winner"))
+                if last_completed_at is None:
+                    last_completed_at = event_date
+                if len(recent_games) < limit:
+                    recent_games.append({
+                        "event_id": event.get("id"),
+                        "date": event_date,
+                        "opponent": opp_comp.get("team", {}).get("displayName"),
+                        "result": "W" if won else "L",
+                        "team_score": team_comp.get("score"),
+                        "opponent_score": opp_comp.get("score"),
+                    })
+            elif status == "pre" and upcoming is None:
+                upcoming = {
+                    "event_id": event.get("id"),
+                    "date": event_date,
+                    "opponent": opp_comp.get("team", {}).get("displayName"),
+                    "home_away": team_comp.get("homeAway"),
+                }
+        rest_days = None
+        try:
+            if last_completed_at and upcoming and upcoming.get("date"):
+                last_dt = datetime.fromisoformat(last_completed_at.replace("Z", "+00:00"))
+                next_dt = datetime.fromisoformat(upcoming["date"].replace("Z", "+00:00"))
+                rest_days = round((next_dt - last_dt).total_seconds() / 86400, 2)
+        except Exception:
+            rest_days = None
+        wins = sum(1 for g in recent_games if g.get("result") == "W")
+        losses = sum(1 for g in recent_games if g.get("result") == "L")
         return {
             "record_last_5": f"{wins}-{losses}" if recent_games else None,
             "wins_last_5": wins,
             "losses_last_5": losses,
             "recent_games": recent_games,
+            "upcoming": upcoming,
+            "last_completed_at": last_completed_at,
+            "rest_days": rest_days,
         }
 
     def _extract_key_stats(self, stats_payload: Dict[str, Any], sport_key: str) -> Dict[str, Any]:
