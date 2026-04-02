@@ -826,16 +826,18 @@ def _market_confidence_from_context(
         if market_type == "total" and weather_count and injury_count:
             reason = "Weather and lineup context both support the current total lean"
 
+        credible = bool(lean) and (pct >= 58 or len(supporting) >= 2) and not (pct < 55 and c["priced_in"] > 0)
         out[market_type] = {
             "pct": pct,
             "tier": tier,
             "status": status,
-            "lean": lean,
-            "reason": reason,
-            "supporting_signals": supporting,
-            "opposing_signals": opposing,
+            "lean": lean if credible else None,
+            "reason": reason if credible else None,
+            "supporting_signals": supporting if credible else [],
+            "opposing_signals": opposing if credible else [],
             "priced_in": c["priced_in"] > 0,
             "volatility": "high" if c["uncertainty"] >= 3 else "medium" if c["uncertainty"] >= 1 else "low",
+            "credible": credible,
             "contributors": c,
         }
     return out
