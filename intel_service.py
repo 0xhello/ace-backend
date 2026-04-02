@@ -4,10 +4,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from market_snapshots import update_snapshot
-from source_adapters import ESPNInjuryAdapter, ESPNScoreboardAdapter, OpenMeteoAdapter
+from source_adapters import ESPNInjuryAdapter, ESPNScoreboardAdapter, ESPNTeamContextAdapter, OpenMeteoAdapter
 
 scoreboard_adapter = ESPNScoreboardAdapter()
 injury_adapter = ESPNInjuryAdapter()
+team_context_adapter = ESPNTeamContextAdapter()
 weather_adapter = OpenMeteoAdapter()
 
 
@@ -74,6 +75,24 @@ def _injury_weight(sport: str, injury: Dict[str, Any]) -> int:
     return base
 
 
+def _team_side(game: Dict[str, Any], team: Optional[str]) -> str:
+    if team == game.get("home_team"):
+        return "home"
+    if team == game.get("away_team"):
+        return "away"
+    return "neutral"
+
+
+
+def _mlb_probable_pitcher_for_team(scoreboard: Optional[Dict[str, Any]], side: str) -> Optional[str]:
+    if not scoreboard:
+        return None
+    probables = scoreboard.get(f"{side}_probables") or []
+    starter = next((p for p in probables if p.get("abbreviation") == "SP" or p.get("name") == "probableStartingPitcher"), None)
+    return (starter or {}).get("athlete")
+
+
+
 def _injury_freshness(injury: Dict[str, Any]) -> str:
     date_str = injury.get("date")
     if not date_str:
@@ -93,7 +112,12 @@ def _injury_freshness(injury: Dict[str, Any]) -> str:
         return "unknown"
 
 
-def _injury_signals(game: Dict[str, Any], injury_resp: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _injury_signals(
+    game: Dict[str, Any],
+    injury_resp: Dict[str, Any],
+    scoreboard: Optional[Dict[str, Any]] = None,
+    team_context: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     injuries = injury_resp.get("injuries", [])
     if not injuries:
         return []
@@ -104,27 +128,43 @@ def _injury_signals(game: Dict[str, Any], injury_resp: Dict[str, Any]) -> List[D
         status = _normalize_status(injury.get("status"))
         weight = _injury_weight(sport, injury)
         freshness = _injury_freshness(injury)
+        side = _team_side(game, injury.get("team"))
+        probable_pitcher = _mlb_probable_pitcher_for_team(scoreboard, side) if game.get("sport") == "baseball_mlb" else None
+        today_relevance = "normal"
+        if probable_pitcher and injury.get("athlete") == probable_pitcher:
+            weight += 3
+            today_relevance = "probable-starter"
+        elif game.get("sport") == "baseball_mlb" and (injury.get("position") or "").upper() == "SP":
+            weight -= 2
+            today_relevance = "rotation-context"
+
+        recent_form = (((team_context or {}).get("teams") or {}).get(side) or {}).get("recent_form", {})
+        if recent_form.get("wins_last_5") == 0:
+            weight += 1
+        elif recent_form.get("wins_last_5", 0) >= 4:
+            weight += 1
+
         # Suppress weak/noisy entries. Board should only surface materially relevant injury context.
         if status not in {"out", "doubtful", "questionable"}:
             continue
         if weight < 4:
             continue
         # Stale injuries (>7 days old) need much higher weight to surface
-        if freshness == "stale" and weight < 7:
+        if freshness == "stale" and today_relevance != "probable-starter" and weight < 8:
             continue
         # Known injuries (3-7 days) need moderately higher weight
-        if freshness == "known" and weight < 5:
+        if freshness == "known" and today_relevance != "probable-starter" and weight < 6:
             continue
-        relevant.append((weight, injury, freshness))
+        relevant.append((weight, injury, freshness, today_relevance))
 
     if not relevant:
         return []
 
     relevant.sort(key=lambda x: x[0], reverse=True)
-    top_weight, top, top_freshness = relevant[0]
+    top_weight, top, top_freshness, top_relevance = relevant[0]
     team = top.get("team")
     status = _normalize_status(top.get("status"))
-    team_burden = sum(weight for weight, injury, _ in relevant if injury.get("team") == team)
+    team_burden = sum(weight for weight, injury, _, _ in relevant if injury.get("team") == team)
     experience = top.get("experience_years") or 0
     position = (top.get("position") or "").upper()
     high_positions = HIGH_IMPACT_POSITIONS.get(sport, set())
@@ -155,7 +195,7 @@ def _injury_signals(game: Dict[str, Any], injury_resp: Dict[str, Any]) -> List[D
         benefits = []
         harms = []
 
-    same_team_count = sum(1 for _, injury, _ in relevant if injury.get("team") == team)
+    same_team_count = sum(1 for _, injury, _, _ in relevant if injury.get("team") == team)
     pos_label = f" ({top['position']})" if top.get("position") else ""
     athlete_name = top.get("athlete") or team
     freshness_note = ""
@@ -164,10 +204,16 @@ def _injury_signals(game: Dict[str, Any], injury_resp: Dict[str, Any]) -> List[D
     elif top_freshness == "known":
         freshness_note = " (recent)"
 
+    relevance_note = ""
+    if top_relevance == "probable-starter":
+        relevance_note = " — directly relevant to today’s probable starter"
+    elif top_relevance == "rotation-context":
+        relevance_note = " — background rotation context"
+
     if same_team_count >= 2:
-        summary = f"{athlete_name}{pos_label} is {status} for {team}{freshness_note}; {same_team_count} key injury flags now affect confidence"
+        summary = f"{athlete_name}{pos_label} is {status} for {team}{freshness_note}{relevance_note}; {same_team_count} key injury flags now affect confidence"
     else:
-        summary = f"{athlete_name}{pos_label} is {status} for {team}{freshness_note}"
+        summary = f"{athlete_name}{pos_label} is {status} for {team}{freshness_note}{relevance_note}"
 
     details = {
         "athlete": top.get("athlete"),
@@ -181,6 +227,8 @@ def _injury_signals(game: Dict[str, Any], injury_resp: Dict[str, Any]) -> List[D
         "source_time": top.get("date"),
         "coverage": injury_resp.get("coverage"),
         "freshness": top_freshness,
+        "today_relevance": top_relevance,
+        "probable_pitcher": _mlb_probable_pitcher_for_team(scoreboard, _team_side(game, team)) if game.get("sport") == "baseball_mlb" else None,
         "relevant_injury_count": len(relevant),
         "same_team_relevant_count": same_team_count,
         "team_injury_burden": team_burden,
@@ -334,7 +382,14 @@ def _synthesize_summary(signals: List[Dict[str, Any]], confidence: Dict[str, Any
 
 
 
-def _confidence_from_context(game: Dict[str, Any], scoreboard: Dict[str, Any] | None, snapshot: Dict[str, Any], injury_resp: Dict[str, Any], weather_resp: Dict[str, Any]) -> Dict[str, Any]:
+def _confidence_from_context(
+    game: Dict[str, Any],
+    scoreboard: Dict[str, Any] | None,
+    snapshot: Dict[str, Any],
+    injury_resp: Dict[str, Any],
+    weather_resp: Dict[str, Any],
+    team_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     base = 72
     reasons: List[str] = []
 
@@ -357,8 +412,19 @@ def _confidence_from_context(game: Dict[str, Any], scoreboard: Dict[str, Any] | 
 
         if fresh_injuries:
             highest = max(_injury_weight(sport, item) for item in fresh_injuries)
-            base -= min(10, highest * 2)
+            probable_starter_hit = False
+            if sport == "baseball_mlb":
+                for item in fresh_injuries:
+                    side = _team_side(game, item.get("team"))
+                    probable = _mlb_probable_pitcher_for_team(scoreboard, side)
+                    if probable and item.get("athlete") == probable:
+                        probable_starter_hit = True
+                        break
+            penalty = min(10, highest * 2) + (3 if probable_starter_hit else 0)
+            base -= penalty
             reasons.append("fresh injury context is affecting confidence")
+            if probable_starter_hit:
+                reasons.append("probable starter status makes the absence more relevant today")
         elif known_injuries:
             highest = max(_injury_weight(sport, item) for item in known_injuries)
             base -= min(5, highest)
@@ -367,6 +433,13 @@ def _confidence_from_context(game: Dict[str, Any], scoreboard: Dict[str, Any] | 
             # Stale injuries have minimal confidence impact — market has long adjusted
             base -= 1
             reasons.append("established injury context acknowledged")
+
+    teams = (team_context or {}).get("teams") or {}
+    home_form = ((teams.get("home") or {}).get("recent_form") or {})
+    away_form = ((teams.get("away") or {}).get("recent_form") or {})
+    if home_form.get("wins_last_5", 0) >= 4 or away_form.get("wins_last_5", 0) >= 4:
+        base += 1
+        reasons.append("recent team form adds a bit more context stability")
 
     weather = weather_resp.get("weather") or {}
     if weather.get("weather_applicable") and (weather.get("wind_speed_10m") or 0) >= 20:
@@ -480,12 +553,13 @@ async def build_game_intel(game: Dict[str, Any]) -> Dict[str, Any]:
             scoreboard_norm = scoreboard_adapter.normalize_event(scoreboard_match)
 
     injuries = await injury_adapter.fetch_for_game(game)
+    team_context = await team_context_adapter.fetch_for_game(game)
     weather = await weather_adapter.fetch_for_game(game)
     snapshot = update_snapshot(game)
-    confidence = _confidence_from_context(game, scoreboard_norm, snapshot, injuries, weather)
+    confidence = _confidence_from_context(game, scoreboard_norm, snapshot, injuries, weather, team_context)
 
     signals: List[Dict[str, Any]] = []
-    signals.extend(_injury_signals(game, injuries))
+    signals.extend(_injury_signals(game, injuries, scoreboard_norm, team_context))
     signals.extend(_weather_signals(game, weather))
 
     if snapshot.get("changed"):
@@ -547,6 +621,7 @@ async def build_game_intel(game: Dict[str, Any]) -> Dict[str, Any]:
                 "url": scoreboard_resp.get("url"),
             },
             "injuries": injuries,
+            "team_context": team_context,
             "weather": weather,
         },
         "coverage": {
@@ -554,6 +629,7 @@ async def build_game_intel(game: Dict[str, Any]) -> Dict[str, Any]:
             "weather_coverage": weather.get("coverage", "none"),
         },
         "scoreboard": scoreboard_norm,
+        "team_context": team_context,
         "snapshot": snapshot,
         "signals": signals,
         "summary": synthesized_summary,

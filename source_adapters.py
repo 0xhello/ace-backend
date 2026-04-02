@@ -69,6 +69,21 @@ class ESPNScoreboardAdapter:
                 return event
         return None
 
+    def _extract_probables(self, competitor: Dict[str, Any]) -> List[Dict[str, Any]]:
+        probables = []
+        for item in competitor.get("probables") or []:
+            athlete = item.get("athlete") or {}
+            probables.append({
+                "name": item.get("name"),
+                "display_name": item.get("displayName"),
+                "abbreviation": item.get("abbreviation"),
+                "athlete_id": athlete.get("id"),
+                "athlete": athlete.get("displayName") or athlete.get("fullName"),
+                "position": athlete.get("position"),
+                "statistics": item.get("statistics") or [],
+            })
+        return probables
+
     def normalize_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
         comp = (event.get("competitions") or [{}])[0]
         competitors = comp.get("competitors") or []
@@ -94,11 +109,118 @@ class ESPNScoreboardAdapter:
                 out["home_score"] = competitor.get("score")
                 out["home_record"] = overall
                 out["home_winner"] = competitor.get("winner")
+                out["home_probables"] = self._extract_probables(competitor)
             elif side == "away":
                 out["away_score"] = competitor.get("score")
                 out["away_record"] = overall
                 out["away_winner"] = competitor.get("winner")
+                out["away_probables"] = self._extract_probables(competitor)
         return out
+
+
+class ESPNTeamContextAdapter:
+    async def _fetch_json(self, client: httpx.AsyncClient, url: str) -> Dict[str, Any]:
+        res = await client.get(url)
+        res.raise_for_status()
+        return res.json()
+
+    def _extract_recent_form(self, team_name: str, events: List[Dict[str, Any]], limit: int = 5) -> Dict[str, Any]:
+        recent_games = []
+        wins = 0
+        losses = 0
+        for event in events[: limit * 2]:
+            comp = (event.get("competitions") or [{}])[0]
+            status = ((comp.get("status") or {}).get("type") or {}).get("state")
+            if status != "post":
+                continue
+            competitors = comp.get("competitors") or []
+            team_comp = next((c for c in competitors if c.get("team", {}).get("displayName") == team_name), None)
+            opp_comp = next((c for c in competitors if c.get("team", {}).get("displayName") != team_name), None)
+            if not team_comp or not opp_comp:
+                continue
+            won = bool(team_comp.get("winner"))
+            wins += 1 if won else 0
+            losses += 0 if won else 1
+            recent_games.append({
+                "event_id": event.get("id"),
+                "date": event.get("date"),
+                "opponent": opp_comp.get("team", {}).get("displayName"),
+                "result": "W" if won else "L",
+                "team_score": team_comp.get("score"),
+                "opponent_score": opp_comp.get("score"),
+            })
+            if len(recent_games) >= limit:
+                break
+        return {
+            "record_last_5": f"{wins}-{losses}" if recent_games else None,
+            "wins_last_5": wins,
+            "losses_last_5": losses,
+            "recent_games": recent_games,
+        }
+
+    def _extract_key_stats(self, stats_payload: Dict[str, Any], sport_key: str) -> Dict[str, Any]:
+        categories = (((stats_payload.get("results") or {}).get("stats") or {}).get("categories") or [])
+        flat: Dict[str, Any] = {}
+        for category in categories:
+            for stat in category.get("stats", []):
+                flat[stat.get("name")] = stat.get("value")
+                flat[f"display::{stat.get('name')}"] = stat.get("displayValue")
+
+        if sport_key == "baseball_mlb":
+            return {
+                "runs_per_game": flat.get("runsPerGame") or flat.get("display::runsPerGame"),
+                "batting_avg": flat.get("avgBattingAverage") or flat.get("display::avgBattingAverage"),
+                "era": flat.get("ERA") or flat.get("display::ERA"),
+            }
+        if sport_key == "basketball_nba":
+            return {
+                "points_per_game": flat.get("avgPoints") or flat.get("display::avgPoints"),
+                "points_allowed_per_game": flat.get("avgPointsAllowed") or flat.get("display::avgPointsAllowed"),
+                "rebounds_per_game": flat.get("avgRebounds") or flat.get("display::avgRebounds"),
+            }
+        return {}
+
+    async def _fetch_team_context(self, client: httpx.AsyncClient, sport_key: str, team_name: str) -> Dict[str, Any]:
+        team_mapping = get_espn_team_mapping(sport_key, team_name)
+        league_bits = ESPN_CORE_LEAGUE_MAP.get(sport_key)
+        if not team_mapping or not league_bits:
+            return {}
+        sport_path, league = league_bits
+        schedule_url = f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/{league}/teams/{team_mapping['espn_id']}/schedule"
+        stats_url = f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/{league}/teams/{team_mapping['espn_id']}/statistics"
+        schedule_payload = await self._fetch_json(client, schedule_url)
+        stats_payload = await self._fetch_json(client, stats_url)
+        recent_form = self._extract_recent_form(team_name, schedule_payload.get("events", []))
+        key_stats = self._extract_key_stats(stats_payload, sport_key)
+        return {
+            "team": team_name,
+            "recent_form": recent_form,
+            "key_stats": key_stats,
+            "schedule_url": schedule_url,
+            "stats_url": stats_url,
+        }
+
+    async def fetch_for_game(self, game: Dict[str, Any]) -> Dict[str, Any]:
+        sport_key = game.get("sport")
+        home_team = game.get("home_team")
+        away_team = game.get("away_team")
+        if sport_key not in ESPN_CORE_LEAGUE_MAP:
+            return {"ok": False, "reason": "unsupported-sport", "teams": {}}
+        try:
+            async with httpx.AsyncClient(timeout=12) as client:
+                home_context = await self._fetch_team_context(client, sport_key, home_team)
+                away_context = await self._fetch_team_context(client, sport_key, away_team)
+            return {
+                "ok": True,
+                "reason": None,
+                "teams": {
+                    "home": home_context,
+                    "away": away_context,
+                },
+                "notes": "Fetched ESPN schedule/statistics context for both teams.",
+            }
+        except Exception as e:
+            return {"ok": False, "reason": str(e), "teams": {}, "notes": "ESPN team context fetch failed."}
 
 
 class ESPNInjuryAdapter:
