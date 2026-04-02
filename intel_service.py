@@ -998,11 +998,16 @@ async def build_board_index(games: List[Dict[str, Any]], limit: int = 50) -> Dic
         confidence = intel.get("confidence")
         # Board should suppress injury noise; keep that depth for tracked/detail views.
         # Only surface injury if it's high severity and confidence is materially degraded.
+        non_team_context_signals = [s for s in raw_signals if s.get("sourceCategory") != "team_context"]
         signals = [
             s for s in raw_signals
             if not (
                 s.get("type") == "injury"
                 and not (s.get("severity") == "high" and (confidence or {}).get("pct", 100) <= 64)
+            )
+            and not (
+                s.get("sourceCategory") == "team_context"
+                and len(non_team_context_signals) > 0
             )
         ]
         top_signal = signals[0] if signals else None
