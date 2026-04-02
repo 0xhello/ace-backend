@@ -982,8 +982,9 @@ async def build_tracked_index(games: List[Dict[str, Any]], limit: int = 10) -> D
             "matchup": f"{game['away_team']} @ {game['home_team']}",
             "sport": game["sport_title"],
             "signals_count": len(intel["signals"]),
-            "summary": intel["signals"][0]["summary"] if intel["signals"] else "No internal signals yet",
+            "summary": intel.get("summary") or (intel["signals"][0]["summary"] if intel["signals"] else "No tracked intelligence yet"),
             "confidence": intel["confidence"],
+            "market_confidence": intel.get("market_confidence", {}),
             "coverage": intel.get("coverage", {}),
             "href": f"/dashboard/tracked/{game['id']}",
         })
