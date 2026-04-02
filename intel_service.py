@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from market_snapshots import update_snapshot
 from source_adapters import ESPNInjuryAdapter, ESPNScoreboardAdapter, ESPNTeamContextAdapter, OpenMeteoAdapter
@@ -614,6 +614,184 @@ def _movement_map(game: Dict[str, Any], snapshot: Dict[str, Any]) -> Dict[str, O
 
 
 
+def _market_tier_status(pct: int) -> Tuple[str, str]:
+    if pct >= 72:
+        return "high", "supported"
+    if pct >= 59:
+        return "medium", "mixed"
+    return "low", "uncertain"
+
+
+
+def _market_signal_split(signals: List[Dict[str, Any]], market_type: str) -> Tuple[List[str], List[str]]:
+    supporting: List[str] = []
+    opposing: List[str] = []
+    for signal in signals:
+        summary = signal.get("summary")
+        if not summary:
+            continue
+        signal_type = signal.get("type")
+        source_category = signal.get("sourceCategory")
+        severity = signal.get("severity")
+        direction = signal.get("direction")
+
+        if market_type == "ml":
+            if signal_type == "injury" and severity in {"high", "medium"}:
+                supporting.append(summary)
+            elif source_category == "team_context":
+                supporting.append(summary)
+            elif signal_type == "weather":
+                opposing.append(summary)
+        elif market_type == "spread":
+            if signal_type == "injury" and severity in {"high", "medium"}:
+                supporting.append(summary)
+            elif signal_type == "market":
+                supporting.append(summary)
+            elif source_category == "team_context" and direction == "negative":
+                supporting.append(summary)
+            elif signal_type == "weather":
+                opposing.append(summary)
+        elif market_type == "total":
+            if signal_type == "weather":
+                supporting.append(summary)
+            elif signal_type == "market":
+                supporting.append(summary)
+            elif signal_type == "injury" and severity in {"high", "medium"}:
+                supporting.append(summary)
+            elif source_category == "team_context" and direction == "positive":
+                opposing.append(summary)
+
+    return supporting[:3], opposing[:3]
+
+
+
+def _market_contributors(
+    game: Dict[str, Any],
+    signals: List[Dict[str, Any]],
+    snapshot: Dict[str, Any],
+    scoreboard: Optional[Dict[str, Any]],
+    weather_resp: Optional[Dict[str, Any]],
+) -> Dict[str, Dict[str, int]]:
+    weather = (weather_resp or {}).get("weather") or {}
+    live_state = bool(scoreboard and scoreboard.get("state") == "in")
+    changed_market = bool(snapshot.get("changed"))
+
+    contrib = {
+        "ml": {"support": 0, "oppose": 0, "uncertainty": 0, "priced_in": 0},
+        "spread": {"support": 0, "oppose": 0, "uncertainty": 0, "priced_in": 0},
+        "total": {"support": 0, "oppose": 0, "uncertainty": 0, "priced_in": 0},
+    }
+
+    for signal in signals:
+        signal_type = signal.get("type")
+        severity = signal.get("severity")
+        severity_weight = 3 if severity == "high" else 2 if severity == "medium" else 1
+        source_category = signal.get("sourceCategory")
+        direction = signal.get("direction")
+
+        if signal_type == "injury":
+            contrib["ml"]["support"] += severity_weight * 2
+            contrib["spread"]["support"] += severity_weight * 3
+            contrib["total"]["support"] += severity_weight
+            if (signal.get("details") or {}).get("freshness") in {"fresh", "recent"}:
+                contrib["ml"]["uncertainty"] += 1
+                contrib["spread"]["uncertainty"] += 1
+        elif signal_type == "weather":
+            contrib["total"]["support"] += severity_weight * 3
+            contrib["ml"]["oppose"] += 1
+            contrib["spread"]["oppose"] += 1
+        elif signal_type == "market":
+            contrib["spread"]["support"] += severity_weight * 2
+            contrib["total"]["support"] += severity_weight * 2
+            contrib["ml"]["uncertainty"] += 1
+        elif source_category == "team_context":
+            if direction == "positive":
+                contrib["ml"]["support"] += 2
+                contrib["spread"]["support"] += 1
+                contrib["total"]["oppose"] += 1
+            elif direction == "negative":
+                contrib["ml"]["support"] += 1
+                contrib["spread"]["support"] += 2
+
+    if changed_market:
+        contrib["ml"]["priced_in"] += 1
+        contrib["spread"]["priced_in"] += 2
+        contrib["total"]["priced_in"] += 2
+    if live_state:
+        contrib["ml"]["uncertainty"] += 2
+        contrib["spread"]["uncertainty"] += 3
+        contrib["total"]["uncertainty"] += 4
+    if weather.get("weather_applicable") and (weather.get("wind_speed_10m") or 0) >= 20:
+        contrib["total"]["support"] += 2
+    if game.get("num_books", 0) >= 8:
+        contrib["ml"]["support"] += 1
+        contrib["spread"]["support"] += 1
+        contrib["total"]["support"] += 1
+
+    return contrib
+
+
+
+def _market_confidence_from_context(
+    game: Dict[str, Any],
+    signals: List[Dict[str, Any]],
+    confidence: Dict[str, Any],
+    snapshot: Dict[str, Any],
+    scoreboard: Optional[Dict[str, Any]] = None,
+    weather_resp: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    base = confidence.get("pct", 62)
+    contributors = _market_contributors(game, signals, snapshot, scoreboard, weather_resp)
+    weather_count = sum(1 for s in signals if s.get("type") == "weather")
+    injury_count = sum(1 for s in signals if s.get("type") == "injury")
+
+    out: Dict[str, Any] = {}
+    for market_type in ("ml", "spread", "total"):
+        c = contributors[market_type]
+        pct = base + (c["support"] * 2) - (c["oppose"] * 2) - (c["uncertainty"] * 3) - (c["priced_in"] * 2)
+        if market_type == "spread":
+            pct -= 2
+        elif market_type == "total":
+            pct += 1 if weather_count or injury_count else -1
+        pct = max(45, min(90, pct))
+
+        tier, status = _market_tier_status(pct)
+        supporting, opposing = _market_signal_split(signals, market_type)
+        lean = None
+        if market_type == "ml":
+            pick = _pick_side_market(game)
+            lean = f"{pick['team']} ML" if pick else None
+        elif market_type == "spread":
+            pick = _pick_side_market(game)
+            lean = f"{pick['team']} spread" if pick else "spread mixed"
+        elif market_type == "total":
+            lean = "under" if weather_count or injury_count else "mixed"
+
+        if supporting and opposing:
+            reason = f"{supporting[0]}, but {opposing[0].lower()}"
+        elif supporting:
+            reason = supporting[0]
+        elif opposing:
+            reason = f"mixed read: {opposing[0]}"
+        else:
+            reason = "limited market-specific signal support so far"
+
+        out[market_type] = {
+            "pct": pct,
+            "tier": tier,
+            "status": status,
+            "lean": lean,
+            "reason": reason,
+            "supporting_signals": supporting,
+            "opposing_signals": opposing,
+            "priced_in": c["priced_in"] > 0,
+            "volatility": "high" if c["uncertainty"] >= 3 else "medium" if c["uncertainty"] >= 1 else "low",
+            "contributors": c,
+        }
+    return out
+
+
+
 def _recommendation_from_context(game: Dict[str, Any], confidence: Dict[str, Any], signals: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if confidence.get("pct", 0) < 70:
         return None
@@ -709,6 +887,7 @@ async def build_game_intel(game: Dict[str, Any]) -> Dict[str, Any]:
 
     recommendation = _recommendation_from_context(game, confidence, signals)
     market_movement = _movement_map(game, snapshot)
+    market_confidence = _market_confidence_from_context(game, signals, confidence, snapshot, scoreboard_norm, weather)
 
     return {
         "game": game,
@@ -735,6 +914,7 @@ async def build_game_intel(game: Dict[str, Any]) -> Dict[str, Any]:
         "summary": synthesized_summary,
         "signal_mode": signal_mode,
         "confidence": confidence,
+        "market_confidence": market_confidence,
         "recommendation": recommendation,
         "market_movement": market_movement,
         "updated_at": _now(),
