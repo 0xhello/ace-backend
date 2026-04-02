@@ -1006,6 +1006,8 @@ async def build_board_index(games: List[Dict[str, Any]], limit: int = 50) -> Dic
             )
         ]
         top_signal = signals[0] if signals else None
+        board_summary = top_signal.get("summary") if top_signal else "No board-level signal surfaced"
+        board_signal_mode = intel.get("signal_mode") if top_signal else None
         items.append({
             "game_id": game["id"],
             "confidence": confidence,
@@ -1018,8 +1020,8 @@ async def build_board_index(games: List[Dict[str, Any]], limit: int = 50) -> Dic
             "has_high_severity": any(s.get("severity") == "high" for s in raw_signals),
             "is_volatile": confidence.get("status") == "volatile" if confidence else False,
             "has_new_signal": len(signals) > 0,
-            "signal_mode": intel.get("signal_mode"),
-            "summary": intel.get("summary") or (top_signal.get("summary") if top_signal else "No internal signals yet"),
+            "signal_mode": board_signal_mode,
+            "summary": board_summary,
             "coverage": intel.get("coverage", {}),
             "updated_at": intel.get("updated_at"),
         })
