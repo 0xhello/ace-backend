@@ -125,9 +125,9 @@ class ESPNTeamContextAdapter:
         return res.json()
 
     def _extract_recent_form(self, team_name: str, events: List[Dict[str, Any]], limit: int = 5) -> Dict[str, Any]:
-        recent_games = []
         upcoming = None
-        last_completed_at = None
+        completed_games = []
+
         for event in events:
             comp = (event.get("competitions") or [{}])[0]
             status = ((comp.get("status") or {}).get("type") or {}).get("state")
@@ -135,36 +135,57 @@ class ESPNTeamContextAdapter:
             competitors = comp.get("competitors") or []
             team_comp = next((c for c in competitors if c.get("team", {}).get("displayName") == team_name), None)
             opp_comp = next((c for c in competitors if c.get("team", {}).get("displayName") != team_name), None)
-            if not team_comp or not opp_comp:
+            if not team_comp or not opp_comp or not event_date:
                 continue
-            if status == "post":
-                won = bool(team_comp.get("winner"))
-                if last_completed_at is None:
-                    last_completed_at = event_date
-                if len(recent_games) < limit:
-                    recent_games.append({
-                        "event_id": event.get("id"),
-                        "date": event_date,
-                        "opponent": opp_comp.get("team", {}).get("displayName"),
-                        "result": "W" if won else "L",
-                        "team_score": team_comp.get("score"),
-                        "opponent_score": opp_comp.get("score"),
-                    })
-            elif status == "pre" and upcoming is None:
+
+            if status == "pre" and upcoming is None:
                 upcoming = {
                     "event_id": event.get("id"),
                     "date": event_date,
                     "opponent": opp_comp.get("team", {}).get("displayName"),
                     "home_away": team_comp.get("homeAway"),
                 }
+            elif status == "post":
+                completed_games.append({
+                    "event_id": event.get("id"),
+                    "date": event_date,
+                    "opponent": opp_comp.get("team", {}).get("displayName"),
+                    "result": "W" if bool(team_comp.get("winner")) else "L",
+                    "team_score": team_comp.get("score"),
+                    "opponent_score": opp_comp.get("score"),
+                })
+
+        def _to_dt(value: str):
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+        completed_games.sort(key=lambda g: g["date"], reverse=True)
+
+        if upcoming and upcoming.get("date"):
+            try:
+                upcoming_dt = _to_dt(upcoming["date"])
+                filtered = []
+                for game in completed_games:
+                    game_dt = _to_dt(game["date"])
+                    delta_days = (upcoming_dt - game_dt).total_seconds() / 86400
+                    if 0 <= delta_days <= 21:
+                        filtered.append(game)
+                recent_games = filtered[:limit] if filtered else completed_games[:limit]
+            except Exception:
+                recent_games = completed_games[:limit]
+        else:
+            recent_games = completed_games[:limit]
+
+        last_completed_at = recent_games[0]["date"] if recent_games else None
         rest_days = None
         try:
             if last_completed_at and upcoming and upcoming.get("date"):
-                last_dt = datetime.fromisoformat(last_completed_at.replace("Z", "+00:00"))
-                next_dt = datetime.fromisoformat(upcoming["date"].replace("Z", "+00:00"))
-                rest_days = round((next_dt - last_dt).total_seconds() / 86400, 2)
+                last_dt = _to_dt(last_completed_at)
+                next_dt = _to_dt(upcoming["date"])
+                candidate_rest = round((next_dt - last_dt).total_seconds() / 86400, 2)
+                rest_days = candidate_rest if 0 <= candidate_rest <= 7 else None
         except Exception:
             rest_days = None
+
         wins = sum(1 for g in recent_games if g.get("result") == "W")
         losses = sum(1 for g in recent_games if g.get("result") == "L")
         return {
