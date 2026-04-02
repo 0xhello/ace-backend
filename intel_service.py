@@ -1006,8 +1006,19 @@ async def build_board_index(games: List[Dict[str, Any]], limit: int = 50) -> Dic
             )
         ]
         top_signal = signals[0] if signals else None
-        board_summary = top_signal.get("summary") if top_signal else "No board-level signal surfaced"
-        board_signal_mode = intel.get("signal_mode") if top_signal else None
+        if top_signal:
+            board_summary = top_signal.get("summary")
+            board_signal_mode = intel.get("signal_mode")
+        else:
+            scoreboard = intel.get("scoreboard") or {}
+            coverage = intel.get("coverage") or {}
+            if scoreboard.get("state") == "in":
+                board_summary = "Live game — no strong board edge surfaced yet"
+            elif coverage.get("injury_coverage") == "full" or coverage.get("weather_coverage") == "full":
+                board_summary = "Monitoring with full source coverage — no strong board edge yet"
+            else:
+                board_summary = "No strong board edge yet"
+            board_signal_mode = None
         items.append({
             "game_id": game["id"],
             "confidence": confidence,
