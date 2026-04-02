@@ -37,7 +37,13 @@ API_KEY = os.getenv("ODDS_API_KEY", "")
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 
 _cache: Dict[str, Any] = {}
-CACHE_TTL = 60
+CACHE_TTL = 300
+LIVE_CACHE_TTL = 90
+DASHBOARD_DEFAULT_SPORTS = [
+    "basketball_nba",
+    "baseball_mlb",
+    "icehockey_nhl",
+]
 
 app = FastAPI(title="ACE Backend", version="0.2.0")
 
@@ -66,13 +72,14 @@ def cache_get(key: str) -> Optional[Any]:
     entry = _cache.get(key)
     if not entry:
         return None
-    if time.time() - entry["ts"] > CACHE_TTL:
+    ttl = entry.get("ttl", CACHE_TTL)
+    if time.time() - entry["ts"] > ttl:
         return None
     return entry["data"]
 
 
-def cache_set(key: str, data: Any) -> None:
-    _cache[key] = {"ts": time.time(), "data": data}
+def cache_set(key: str, data: Any, ttl: Optional[int] = None) -> None:
+    _cache[key] = {"ts": time.time(), "data": data, "ttl": ttl or CACHE_TTL}
 
 
 async def odds_request(path: str, params: Dict[str, Any] = {}) -> Any:
@@ -156,7 +163,12 @@ async def load_games_payload(
     regions: str = REGIONS,
     markets: str = MARKETS,
 ) -> Dict[str, Any]:
-    sport_list = sports.split(",") if sports else DEFAULT_SPORTS
+    sport_list = [s.strip() for s in sports.split(",")] if sports else DASHBOARD_DEFAULT_SPORTS
+    payload_cache_key = f"games-payload:{'|'.join(sport_list)}:{regions}:{markets}"
+    cached_payload = cache_get(payload_cache_key)
+    if cached_payload:
+        return cached_payload
+
     all_games = []
     errors = []
     for sport in sport_list:
@@ -171,7 +183,8 @@ async def load_games_payload(
                 {"regions": regions, "markets": markets, "oddsFormat": "american"},
             )
             games = [normalize_game(g, sport) for g in raw]
-            cache_set(cache_key, games)
+            ttl = LIVE_CACHE_TTL if any(g.get("status") == "live" for g in games) else CACHE_TTL
+            cache_set(cache_key, games, ttl=ttl)
             all_games.extend(games)
         except HTTPException as e:
             errors.append({
@@ -180,7 +193,7 @@ async def load_games_payload(
                 "detail": e.detail,
             })
             continue
-    return {
+    payload = {
         "count": len(all_games),
         "sports": sport_list,
         "games": all_games,
@@ -188,6 +201,9 @@ async def load_games_payload(
         "data_status": "degraded" if errors else "ok",
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
+    payload_ttl = LIVE_CACHE_TTL if any(g.get("status") == "live" for g in all_games) else CACHE_TTL
+    cache_set(payload_cache_key, payload, ttl=payload_ttl)
+    return payload
 
 
 @app.get("/health")
