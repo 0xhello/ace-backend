@@ -193,6 +193,8 @@ async def load_games_payload(
                 "detail": e.detail,
             })
             continue
+    all_games = await attach_live_scoreboards(all_games)
+
     payload = {
         "count": len(all_games),
         "sports": sport_list,
