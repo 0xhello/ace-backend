@@ -295,6 +295,13 @@ async def get_board_intel(limit: int = Query(50, ge=1, le=100)):
     return await build_board_index(payload["games"], limit=limit)
 
 
+@app.get("/intel/live-board")
+async def get_live_board_intel(limit: int = Query(20, ge=1, le=100)):
+    payload = await load_games_payload()
+    live_games = [g for g in payload["games"] if g.get("status") == "live"]
+    return await build_board_index(live_games, limit=limit)
+
+
 @app.get("/intel/picks")
 async def get_top_picks(limit: int = Query(4, ge=1, le=12)):
     payload = await load_games_payload()
