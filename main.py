@@ -19,6 +19,7 @@ Intelligence adapters: ESPN scoreboard, ESPN injuries (pending team mapping), Op
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from datetime import datetime, timezone
@@ -69,6 +70,20 @@ REGIONS = "us"
 MARKETS = "h2h,spreads,totals"
 
 scoreboard_adapter = ESPNScoreboardAdapter()
+
+
+def log_live_scoreboard_skip(stage: str, game: Dict[str, Any], error: Optional[Exception] = None) -> None:
+    payload = {
+        "kind": "live_scoreboard_skip",
+        "stage": stage,
+        "sport": game.get("sport"),
+        "game_id": game.get("id"),
+        "away_team": game.get("away_team"),
+        "home_team": game.get("home_team"),
+        "error": str(error) if error else None,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    print(json.dumps(payload), flush=True)
 
 
 def cache_get(key: str) -> Optional[Any]:
@@ -173,14 +188,22 @@ async def attach_live_scoreboards(games: list[Dict[str, Any]]) -> list[Dict[str,
                 sport = game.get("sport")
                 if sport not in events_by_sport:
                     fetched = await scoreboard_adapter.fetch_for_sport(sport)
-                    events_by_sport[sport] = fetched.get("events", []) if fetched.get("ok") else []
+                    if not fetched.get("ok"):
+                        log_live_scoreboard_skip("fetch_failed", game)
+                        events_by_sport[sport] = []
+                    else:
+                        events_by_sport[sport] = fetched.get("events", [])
                 matched = scoreboard_adapter.match_event(game, events_by_sport.get(sport, []))
-                if matched:
-                    game["scoreboard"] = scoreboard_adapter.normalize_event(matched)
-            except Exception:
+                if not matched:
+                    log_live_scoreboard_skip("match_failed", game)
+                    continue
+                game["scoreboard"] = scoreboard_adapter.normalize_event(matched)
+            except Exception as e:
+                log_live_scoreboard_skip("hydrate_exception", game, e)
                 continue
         return games
-    except Exception:
+    except Exception as e:
+        print(json.dumps({"kind": "live_scoreboard_skip", "stage": "outer_exception", "error": str(e), "ts": datetime.now(timezone.utc).isoformat()}), flush=True)
         return games
 
 
