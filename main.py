@@ -298,8 +298,25 @@ async def get_board_intel(limit: int = Query(50, ge=1, le=100)):
 @app.get("/intel/live-board")
 async def get_live_board_intel(limit: int = Query(20, ge=1, le=100)):
     payload = await load_games_payload()
-    live_games = [g for g in payload["games"] if g.get("status") == "live"]
-    return await build_board_index(live_games, limit=limit)
+    live_games = [g for g in payload["games"] if g.get("status") == "live"][:limit]
+
+    items = []
+    events_by_sport: Dict[str, list] = {}
+    for game in live_games:
+        sport = game.get("sport")
+        if sport not in events_by_sport:
+            fetched = await scoreboard_adapter.fetch_for_sport(sport)
+            events_by_sport[sport] = fetched.get("events", []) if fetched.get("ok") else []
+        matched = scoreboard_adapter.match_event(game, events_by_sport.get(sport, []))
+        if not matched:
+            continue
+        items.append({
+            "game_id": game["id"],
+            "scoreboard": scoreboard_adapter.normalize_event(matched),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    return {"count": len(items), "items": items, "updated_at": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/intel/picks")
