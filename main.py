@@ -30,6 +30,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from intel_service import build_board_index, build_game_intel, build_top_picks, build_tracked_index
+from source_adapters import ESPNScoreboardAdapter
 
 load_dotenv()
 
@@ -66,6 +67,8 @@ DEFAULT_SPORTS = [
 
 REGIONS = "us"
 MARKETS = "h2h,spreads,totals"
+
+scoreboard_adapter = ESPNScoreboardAdapter()
 
 
 def cache_get(key: str) -> Optional[Any]:
@@ -156,6 +159,23 @@ def is_live(commence_time: Optional[str]) -> bool:
         return 0 <= diff <= 14400
     except Exception:
         return False
+
+
+async def attach_live_scoreboards(games: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    live_games = [g for g in games if g.get("status") == "live"]
+    if not live_games:
+        return games
+
+    events_by_sport: Dict[str, list] = {}
+    for game in live_games:
+        sport = game.get("sport")
+        if sport not in events_by_sport:
+            fetched = await scoreboard_adapter.fetch_for_sport(sport)
+            events_by_sport[sport] = fetched.get("events", []) if fetched.get("ok") else []
+        matched = scoreboard_adapter.match_event(game, events_by_sport.get(sport, []))
+        if matched:
+            game["scoreboard"] = scoreboard_adapter.normalize_event(matched)
+    return games
 
 
 async def load_games_payload(
