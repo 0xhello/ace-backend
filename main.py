@@ -166,16 +166,22 @@ async def attach_live_scoreboards(games: list[Dict[str, Any]]) -> list[Dict[str,
     if not live_games:
         return games
 
-    events_by_sport: Dict[str, list] = {}
-    for game in live_games:
-        sport = game.get("sport")
-        if sport not in events_by_sport:
-            fetched = await scoreboard_adapter.fetch_for_sport(sport)
-            events_by_sport[sport] = fetched.get("events", []) if fetched.get("ok") else []
-        matched = scoreboard_adapter.match_event(game, events_by_sport.get(sport, []))
-        if matched:
-            game["scoreboard"] = scoreboard_adapter.normalize_event(matched)
-    return games
+    try:
+        events_by_sport: Dict[str, list] = {}
+        for game in live_games:
+            try:
+                sport = game.get("sport")
+                if sport not in events_by_sport:
+                    fetched = await scoreboard_adapter.fetch_for_sport(sport)
+                    events_by_sport[sport] = fetched.get("events", []) if fetched.get("ok") else []
+                matched = scoreboard_adapter.match_event(game, events_by_sport.get(sport, []))
+                if matched:
+                    game["scoreboard"] = scoreboard_adapter.normalize_event(matched)
+            except Exception:
+                continue
+        return games
+    except Exception:
+        return games
 
 
 async def load_games_payload(
